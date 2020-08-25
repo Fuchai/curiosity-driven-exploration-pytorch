@@ -50,17 +50,19 @@ class ICMAgent(object):
                                     lr=learning_rate)
         self.icm = self.icm.to(self.device)
 
+        self.model=nn.DataParallel(self.model)
         self.model = self.model.to(self.device)
 
     def get_action(self, state):
-        state = torch.Tensor(state).to(self.device)
-        state = state.float()
-        policy, value = self.model(state)
-        action_prob = F.softmax(policy, dim=-1).data.cpu().numpy()
+        with torch.no_grad():
+            state = torch.Tensor(state).to(self.device)
+            state = state.float()
+            policy, value = self.model(state)
+            action_prob = F.softmax(policy, dim=-1).data.cpu().numpy()
 
-        action = self.random_choice_prob_index(action_prob)
+            action = self.random_choice_prob_index(action_prob)
 
-        return action, value.data.cpu().numpy().squeeze(), policy.detach()
+            return action, value.data.cpu().numpy().squeeze(), policy.detach()
 
     @staticmethod
     def random_choice_prob_index(p, axis=1):
@@ -68,19 +70,20 @@ class ICMAgent(object):
         return (p.cumsum(axis=axis) > r).argmax(axis=axis)
 
     def compute_intrinsic_reward(self, state, next_state, action):
-        state = torch.FloatTensor(state).to(self.device)
-        next_state = torch.FloatTensor(next_state).to(self.device)
-        action = torch.LongTensor(action).to(self.device)
+        with torch.no_grad():
+            state = torch.FloatTensor(state).to(self.device)
+            next_state = torch.FloatTensor(next_state).to(self.device)
+            action = torch.LongTensor(action).to(self.device)
 
-        action_onehot = torch.FloatTensor(
-            len(action), self.output_size).to(
-            self.device)
-        action_onehot.zero_()
-        action_onehot.scatter_(1, action.view(len(action), -1), 1)
+            action_onehot = torch.FloatTensor(
+                len(action), self.output_size).to(
+                self.device)
+            action_onehot.zero_()
+            action_onehot.scatter_(1, action.view(len(action), -1), 1)
 
-        real_next_state_feature, pred_next_state_feature, pred_action = self.icm(
-            [state, next_state, action_onehot])
-        intrinsic_reward = self.eta * F.mse_loss(real_next_state_feature, pred_next_state_feature, reduction='none').mean(-1)
+            real_next_state_feature, pred_next_state_feature, pred_action = self.icm(
+                [state, next_state, action_onehot])
+            intrinsic_reward = self.eta * F.mse_loss(real_next_state_feature, pred_next_state_feature, reduction='none').mean(-1)
         return intrinsic_reward.data.cpu().numpy()
 
     def train_model(self, s_batch, next_s_batch, target_batch, y_batch, adv_batch, old_policy):

@@ -222,7 +222,7 @@ class AtariEnvironment(Environment):
             self.history[i, :, :] = self.pre_proc(s)
 
 
-class MarioEnvironment(Process):
+class MarioEnvironment(Environment):
     def __init__(
             self,
             env_id,

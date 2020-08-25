@@ -9,16 +9,18 @@ from tensorboardX import SummaryWriter
 import numpy as np
 import copy
 
+def interact(parent_conns,actions):
+    pass
 
 def main():
     print({section: dict(config[section]) for section in config.sections()})
     train_method = default_config['TrainMethod']
     env_id = default_config['EnvID']
-    env_type = default_config['EnvType']
+    EnvType = default_config['EnvType']
 
-    if env_type == 'mario':
+    if EnvType == 'mario':
         env = JoypadSpace(gym_super_mario_bros.make(env_id), COMPLEX_MOVEMENT)
-    elif env_type == 'atari':
+    elif EnvType == 'atari':
         env = gym.make(env_id)
     else:
         raise NotImplementedError
@@ -66,9 +68,9 @@ def main():
     agent = ICMAgent
 
     if default_config['EnvType'] == 'atari':
-        env_type = AtariEnvironment
+        EnvType = AtariEnvironment
     elif default_config['EnvType'] == 'mario':
-        env_type = MarioEnvironment
+        EnvType = MarioEnvironment
     else:
         raise NotImplementedError
 
@@ -102,7 +104,7 @@ def main():
     child_conns = []
     for idx in range(num_worker):
         parent_conn, child_conn = Pipe()
-        work = env_type(env_id, is_render, idx, child_conn)
+        work = EnvType(env_id, is_render, idx, child_conn)
         work.start()
         works.append(work)
         parent_conns.append(parent_conn)
@@ -126,6 +128,8 @@ def main():
         steps += num_worker
         actions = np.random.randint(0, output_size, size=(num_worker,))
 
+        interact(parent_conns, actions)
+
         for parent_conn, action in zip(parent_conns, actions):
             parent_conn.send(action)
 
@@ -138,13 +142,16 @@ def main():
     print('End to initalize...')
 
     while True:
-        total_state, total_reward, total_done, total_next_state, total_action, total_int_reward, total_next_obs, total_values, total_policy = \
+        total_state, total_reward, total_done, total_next_state, total_action, \
+        total_int_reward, total_next_obs, total_values, total_policy = \
             [], [], [], [], [], [], [], [], []
         global_step += (num_worker * num_step)
         global_update += 1
 
         # Step 1. n-step rollout
         for _ in range(num_step):
+            # everything is detached.
+            # the agent interacts in eval(), completely not differentiable.
             actions, value, policy = agent.get_action((states - obs_rms.mean) / np.sqrt(obs_rms.var))
 
             for parent_conn, action in zip(parent_conns, actions):
@@ -165,6 +172,7 @@ def main():
             real_dones = np.hstack(real_dones)
 
             # total reward = int reward
+            # TODO review rewards calculation
             intrinsic_reward = agent.compute_intrinsic_reward(
                 (states - obs_rms.mean) / np.sqrt(obs_rms.var),
                 (next_states - obs_rms.mean) / np.sqrt(obs_rms.var),
@@ -197,6 +205,8 @@ def main():
         # calculate last next value
         _, value, _ = agent.get_action((states - obs_rms.mean) / np.sqrt(obs_rms.var))
         total_values.append(value)
+
+
         # --------------------------------------------------
 
         total_state = np.stack(total_state).transpose([1, 0, 2, 3, 4]).reshape([-1, 4, 84, 84])
@@ -206,7 +216,7 @@ def main():
         total_values = np.stack(total_values).transpose()
         total_logging_policy = torch.stack(total_policy).view(-1, output_size).cpu().numpy()
 
-        # Step 2. calculate intrinsic reward
+        # Step 2. reform intrinsic reward
         # running mean intrinsic reward
         total_int_reward = np.stack(total_int_reward).transpose()
         total_reward_per_env = np.array([discounted_reward.update(reward_per_step) for reward_per_step in
@@ -224,6 +234,7 @@ def main():
         writer.add_scalar('data/max_prob', softmax(total_logging_policy).max(1).mean(), sample_episode)
 
         # Step 3. make target and advantage
+        # TODO how is advantage calculated particularly?
         target, adv = make_train_data(total_int_reward,
                                       np.zeros_like(total_int_reward),
                                       total_values,
@@ -235,6 +246,7 @@ def main():
         # -----------------------------------------------
 
         # Step 5. Training!
+        # TODO why do you take the next state as the input?
         agent.train_model((total_state - obs_rms.mean) / np.sqrt(obs_rms.var),
                           (total_next_state - obs_rms.mean) / np.sqrt(obs_rms.var),
                           target, total_action,
