@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.distributions.categorical import Categorical
 
 from model import CnnActorCriticNetwork, ICMModel
-
+import torch.distributed as dist
 
 class ICMAgent(object):
     def __init__(
@@ -28,7 +28,9 @@ class ICMAgent(object):
             eta=0.01,
             use_gae=True,
             use_cuda=False,
-            use_noisy_net=False):
+            use_noisy_net=False,
+            gpu=None):
+        # TODO difference between model and icm?
         self.model = CnnActorCriticNetwork(input_size, output_size, use_noisy_net)
         self.num_env = num_env
         self.output_size = output_size
@@ -43,17 +45,28 @@ class ICMAgent(object):
         self.eta = eta
         self.ppo_eps = ppo_eps
         self.clip_grad_norm = clip_grad_norm
-        self.device = torch.device('cuda' if use_cuda else 'cpu')
+        self.device = torch.device('cuda:0' if use_cuda else 'cpu')
 
         self.icm = ICMModel(input_size, output_size, use_cuda)
         self.optimizer = optim.Adam(list(self.model.parameters()) + list(self.icm.parameters()),
                                     lr=learning_rate)
-        self.icm = self.icm.to(self.device)
 
-        self.model=nn.DataParallel(self.model)
-        self.model = self.model.to(self.device)
+        self.icm = self.icm.cuda(gpu)
+        self.model = self.model.cuda(gpu)
+        self.icm = nn.parallel.DistributedDataParallel(self.icm, device_ids=[gpu])
+        self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[gpu])
+
+        # self.icm = self.icm.to(self.device)
+        # self.model = self.model.to(self.device)
 
     def get_action(self, state):
+        """
+        This
+        :param state:
+        :return:
+        """
+        # # scatter over the batch dimension
+        # dist.scatter(state_scatter, torch.chunk(state, dist.get_world_size(), dim=0))
         with torch.no_grad():
             state = torch.Tensor(state).to(self.device)
             state = state.float()
@@ -70,6 +83,13 @@ class ICMAgent(object):
         return (p.cumsum(axis=axis) > r).argmax(axis=axis)
 
     def compute_intrinsic_reward(self, state, next_state, action):
+        """
+        This
+        :param state:
+        :param next_state:
+        :param action:
+        :return:
+        """
         with torch.no_grad():
             state = torch.FloatTensor(state).to(self.device)
             next_state = torch.FloatTensor(next_state).to(self.device)
@@ -87,6 +107,16 @@ class ICMAgent(object):
         return intrinsic_reward.data.cpu().numpy()
 
     def train_model(self, s_batch, next_s_batch, target_batch, y_batch, adv_batch, old_policy):
+        """
+        This
+        :param s_batch:
+        :param next_s_batch:
+        :param target_batch:
+        :param y_batch:
+        :param adv_batch:
+        :param old_policy:
+        :return:
+        """
         s_batch = torch.FloatTensor(s_batch).to(self.device)
         next_s_batch = torch.FloatTensor(next_s_batch).to(self.device)
         target_batch = torch.FloatTensor(target_batch).to(self.device)

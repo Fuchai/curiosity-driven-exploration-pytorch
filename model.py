@@ -151,7 +151,7 @@ class ICMModel(nn.Module):
 
         self.input_size = input_size
         self.output_size = output_size
-        self.device = torch.device('cuda' if use_cuda else 'cpu')
+        self.device = torch.device('cuda:0' if use_cuda else 'cpu')
 
         feature_output = 7 * 7 * 64
         self.feature = nn.Sequential(

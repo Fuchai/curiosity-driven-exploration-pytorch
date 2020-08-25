@@ -38,7 +38,7 @@ def make_train_data(reward, done, value, gamma, num_step, num_worker):
     return discounted_return.reshape([-1]), adv.reshape([-1])
 
 
-class RunningMeanStd(object):
+class RunningMeanStd():
     # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
     def __init__(self, epsilon=1e-4, shape=()):
         self.mean = np.zeros(shape, 'float64')
@@ -66,6 +66,9 @@ class RunningMeanStd(object):
         self.mean = new_mean
         self.var = new_var
         self.count = new_count
+
+    def normalize(self, state_nd_array):
+        return (state_nd_array - self.mean) / np.sqrt(self.var)
 
 
 class RewardForwardFilter(object):

@@ -1,18 +1,59 @@
+import argparse
+import os
+
 from agents import *
 from envs import *
 from utils import *
 from config import *
 from torch.multiprocessing import Pipe
-
+import torch.distributed as dist
 from tensorboardX import SummaryWriter
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import numpy as np
 import copy
 
-def interact(parent_conns,actions):
-    pass
 
-def main():
+def interact(parent_conns, actions):
+    ss = []
+    rs = []
+    ds = []
+    rds = []
+    lrs = []
+
+    for parent_conn, action in zip(parent_conns, actions):
+        parent_conn.send(action)
+
+    for parent_conn in parent_conns:
+        s, r, d, rd, lr = parent_conn.recv()
+        ss.append(s)
+        rs.append(r)
+        ds.append(d)
+        rds.append(rd)
+        lrs.append(lr)
+
+    return ss, rs, ds, rds, lrs
+
+
+def setup(rank, world_size):
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+def single_gpu_work(gpu, args):
+    rank = args.node_rank * args.gpus + gpu
+    dist.init_process_group(backend="nccl",
+                            init_method='env://',
+                            world_size=args.world_size,
+                            rank=rank)
+
+    torch.cuda.set_device(gpu)
+
     print({section: dict(config[section]) for section in config.sections()})
     train_method = default_config['TrainMethod']
     env_id = default_config['EnvID']
@@ -37,21 +78,22 @@ def main():
     model_path = 'models/{}.model'.format(env_id)
     icm_path = 'models/{}.icm'.format(env_id)
 
-    writer = SummaryWriter()
+    if args.node_rank == 0:
+        writer = SummaryWriter()
 
     use_cuda = default_config.getboolean('UseGPU')
     use_gae = default_config.getboolean('UseGAE')
     use_noisy_net = default_config.getboolean('UseNoisyNet')
 
     lam = float(default_config['Lambda'])
-    num_worker = int(default_config['NumEnv'])
+    num_env = int(default_config['NumEnv'])
 
     num_step = int(default_config['NumStep'])
 
     ppo_eps = float(default_config['PPOEps'])
     epoch = int(default_config['Epoch'])
     mini_batch = int(default_config['MiniBatch'])
-    batch_size = int(num_step * num_worker / mini_batch)
+    batch_size = int(num_step * num_env / mini_batch)
     learning_rate = float(default_config['LearningRate'])
     entropy_coef = float(default_config['Entropy'])
     gamma = float(default_config['Gamma'])
@@ -77,7 +119,7 @@ def main():
     agent = agent(
         input_size,
         output_size,
-        num_worker,
+        num_env,
         num_step,
         gamma,
         lam=lam,
@@ -90,7 +132,8 @@ def main():
         eta=eta,
         use_cuda=use_cuda,
         use_gae=use_gae,
-        use_noisy_net=use_noisy_net
+        use_noisy_net=use_noisy_net,
+        gpu=gpu
     )
 
     if is_load_model:
@@ -99,18 +142,19 @@ def main():
         else:
             agent.model.load_state_dict(torch.load(model_path, map_location='cpu'))
 
-    works = []
+    print("Opening environment processes and pipes")
+    envs = []
     parent_conns = []
     child_conns = []
-    for idx in range(num_worker):
+    for idx in range(num_env):
         parent_conn, child_conn = Pipe()
-        work = EnvType(env_id, is_render, idx, child_conn)
-        work.start()
-        works.append(work)
+        env = EnvType(env_id, is_render, idx, child_conn)
+        env.start()
+        envs.append(env)
         parent_conns.append(parent_conn)
         child_conns.append(child_conn)
 
-    states = np.zeros([num_worker, 4, 84, 84])
+    states = np.zeros([num_env, 4, 84, 84])
 
     sample_episode = 0
     sample_rall = 0
@@ -125,18 +169,20 @@ def main():
     next_obs = []
     steps = 0
     while steps < pre_obs_norm_step:
-        steps += num_worker
-        actions = np.random.randint(0, output_size, size=(num_worker,))
+        steps += num_env
+        actions = np.random.randint(0, output_size, size=(num_env,))
 
-        interact(parent_conns, actions)
+        ss, rs, ds, rds, lrs = interact(parent_conns, actions)
+        next_obs += ss
 
-        for parent_conn, action in zip(parent_conns, actions):
-            parent_conn.send(action)
+        # for parent_conn, action in zip(parent_conns, actions):
+        #     parent_conn.send(action)
+        #
+        # for parent_conn in parent_conns:
+        #     s, r, d, rd, lr = parent_conn.recv()
+        #     next_obs.append(s[:])
 
-        for parent_conn in parent_conns:
-            s, r, d, rd, lr = parent_conn.recv()
-            next_obs.append(s[:])
-
+    # TODO all reduce here to collect average
     next_obs = np.stack(next_obs)
     obs_rms.update(next_obs)
     print('End to initalize...')
@@ -145,26 +191,29 @@ def main():
         total_state, total_reward, total_done, total_next_state, total_action, \
         total_int_reward, total_next_obs, total_values, total_policy = \
             [], [], [], [], [], [], [], [], []
-        global_step += (num_worker * num_step)
+        global_step += (num_env * num_step)
         global_update += 1
 
         # Step 1. n-step rollout
         for _ in range(num_step):
             # everything is detached.
             # the agent interacts in eval(), completely not differentiable.
-            actions, value, policy = agent.get_action((states - obs_rms.mean) / np.sqrt(obs_rms.var))
+            # TODO this is not a map reduce, because all gpus have the same weights
+            actions, value, policy = agent.get_action(obs_rms.normalize(states))
 
-            for parent_conn, action in zip(parent_conns, actions):
-                parent_conn.send(action)
+            next_states, rewards, dones, real_dones, log_rewards = interact(parent_conns, actions)
 
-            next_states, rewards, dones, real_dones, log_rewards, next_obs = [], [], [], [], [], []
-            for parent_conn in parent_conns:
-                s, r, d, rd, lr = parent_conn.recv()
-                next_states.append(s)
-                rewards.append(r)
-                dones.append(d)
-                real_dones.append(rd)
-                log_rewards.append(lr)
+            # for parent_conn, action in zip(parent_conns, actions):
+            #     parent_conn.send(action)
+            #
+            # next_states, rewards, dones, real_dones, log_rewards, next_obs = [], [], [], [], [], []
+            # for parent_conn in parent_conns:
+            #     s, r, d, rd, lr = parent_conn.recv()
+            #     next_states.append(s)
+            #     rewards.append(r)
+            #     dones.append(d)
+            #     real_dones.append(rd)
+            #     log_rewards.append(lr)
 
             next_states = np.stack(next_states)
             rewards = np.hstack(rewards)
@@ -174,8 +223,8 @@ def main():
             # total reward = int reward
             # TODO review rewards calculation
             intrinsic_reward = agent.compute_intrinsic_reward(
-                (states - obs_rms.mean) / np.sqrt(obs_rms.var),
-                (next_states - obs_rms.mean) / np.sqrt(obs_rms.var),
+                obs_rms.normalize(states),
+                obs_rms.normalize(next_states),
                 actions)
             sample_i_rall += intrinsic_reward[sample_env_idx]
 
@@ -193,7 +242,7 @@ def main():
             sample_rall += log_rewards[sample_env_idx]
 
             sample_step += 1
-            if real_dones[sample_env_idx]:
+            if real_dones[sample_env_idx] and args.node_rank==0:
                 sample_episode += 1
                 writer.add_scalar('data/reward_per_epi', sample_rall, sample_episode)
                 writer.add_scalar('data/reward_per_rollout', sample_rall, global_update)
@@ -203,9 +252,9 @@ def main():
                 sample_i_rall = 0
 
         # calculate last next value
-        _, value, _ = agent.get_action((states - obs_rms.mean) / np.sqrt(obs_rms.var))
-        total_values.append(value)
+        _, value, _ = agent.get_action(obs_rms.normalize(states))
 
+        total_values.append(value)
 
         # --------------------------------------------------
 
@@ -226,12 +275,13 @@ def main():
 
         # normalize intrinsic reward
         total_int_reward /= np.sqrt(reward_rms.var)
-        writer.add_scalar('data/int_reward_per_epi', np.sum(total_int_reward) / num_worker, sample_episode)
-        writer.add_scalar('data/int_reward_per_rollout', np.sum(total_int_reward) / num_worker, global_update)
-        # -------------------------------------------------------------------------------------------
+        if args.node_rank == 0:
+            writer.add_scalar('data/int_reward_per_epi', np.sum(total_int_reward) / num_env, sample_episode)
+            writer.add_scalar('data/int_reward_per_rollout', np.sum(total_int_reward) / num_env, global_update)
+            # -------------------------------------------------------------------------------------------
 
-        # logging Max action probability
-        writer.add_scalar('data/max_prob', softmax(total_logging_policy).max(1).mean(), sample_episode)
+            # logging Max action probability
+            writer.add_scalar('data/max_prob', softmax(total_logging_policy).max(1).mean(), sample_episode)
 
         # Step 3. make target and advantage
         # TODO how is advantage calculated particularly?
@@ -240,23 +290,43 @@ def main():
                                       total_values,
                                       gamma,
                                       num_step,
-                                      num_worker)
+                                      num_env)
 
         adv = (adv - np.mean(adv)) / (np.std(adv) + 1e-8)
         # -----------------------------------------------
 
-        # Step 5. Training!
+        # Step 4. Training!
         # TODO why do you take the next state as the input?
-        agent.train_model((total_state - obs_rms.mean) / np.sqrt(obs_rms.var),
-                          (total_next_state - obs_rms.mean) / np.sqrt(obs_rms.var),
+        agent.train_model(obs_rms.normalize(total_state),
+                          obs_rms.normalize(total_next_state),
                           target, total_action,
                           adv,
                           total_policy)
+        if args.node_rank == 0:
+            if global_step % (num_env * num_step * 100) == 0:
+                print('Now Global Step :{}'.format(global_step))
+                torch.save(agent.model.state_dict(), model_path)
+                torch.save(agent.icm.state_dict(), icm_path)
 
-        if global_step % (num_worker * num_step * 100) == 0:
-            print('Now Global Step :{}'.format(global_step))
-            torch.save(agent.model.state_dict(), model_path)
-            torch.save(agent.icm.state_dict(), icm_path)
+
+def main():
+    mp.set_start_method('fork')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-n', '--nodes', default=1,
+                        type=int, metavar='N')
+    parser.add_argument('-g', '--gpus', default=1, type=int,
+                        help='number of gpus per node')
+    parser.add_argument('-nr', '--node_rank', default=0, type=int,
+                        help='ranking within the nodes')
+    args = parser.parse_args()
+    #########################################################
+    args.world_size = args.gpus * args.nodes  #
+    os.environ['MASTER_ADDR'] = 'frost-6.las.iastate.edu'  #
+    os.environ['MASTER_PORT'] = '8888'  #
+    # you must fork, so that environments can be forked again. Do not spawn
+    mp.start_processes(single_gpu_work, nprocs=args.gpus, args=(args,), start_method="fork")  #
+    # single_gpu_work(0,args)  #
+    #########################################################
 
 
 if __name__ == '__main__':
