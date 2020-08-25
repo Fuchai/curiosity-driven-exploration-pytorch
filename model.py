@@ -146,12 +146,12 @@ class CnnActorCriticNetwork(nn.Module):
 
 
 class ICMModel(nn.Module):
-    def __init__(self, input_size, output_size, use_cuda=True):
+    def __init__(self, input_size, output_size, device):
         super(ICMModel, self).__init__()
 
         self.input_size = input_size
         self.output_size = output_size
-        self.device = torch.device('cuda:0' if use_cuda else 'cpu')
+        self.device = device
 
         feature_output = 7 * 7 * 64
         self.feature = nn.Sequential(

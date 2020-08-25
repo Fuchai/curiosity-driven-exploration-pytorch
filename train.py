@@ -45,7 +45,7 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def single_gpu_work(gpu, args):
+def single_process_main(gpu, args):
     rank = args.node_rank * args.gpus + gpu
     dist.init_process_group(backend="nccl",
                             init_method='env://',
@@ -78,7 +78,7 @@ def single_gpu_work(gpu, args):
     model_path = 'models/{}.model'.format(env_id)
     icm_path = 'models/{}.icm'.format(env_id)
 
-    if args.node_rank == 0:
+    if rank == 0:
         writer = SummaryWriter()
 
     use_cuda = default_config.getboolean('UseGPU')
@@ -242,7 +242,7 @@ def single_gpu_work(gpu, args):
             sample_rall += log_rewards[sample_env_idx]
 
             sample_step += 1
-            if real_dones[sample_env_idx] and args.node_rank==0:
+            if real_dones[sample_env_idx] and rank==0:
                 sample_episode += 1
                 writer.add_scalar('data/reward_per_epi', sample_rall, sample_episode)
                 writer.add_scalar('data/reward_per_rollout', sample_rall, global_update)
@@ -275,7 +275,7 @@ def single_gpu_work(gpu, args):
 
         # normalize intrinsic reward
         total_int_reward /= np.sqrt(reward_rms.var)
-        if args.node_rank == 0:
+        if rank == 0:
             writer.add_scalar('data/int_reward_per_epi', np.sum(total_int_reward) / num_env, sample_episode)
             writer.add_scalar('data/int_reward_per_rollout', np.sum(total_int_reward) / num_env, global_update)
             # -------------------------------------------------------------------------------------------
@@ -302,7 +302,7 @@ def single_gpu_work(gpu, args):
                           target, total_action,
                           adv,
                           total_policy)
-        if args.node_rank == 0:
+        if rank == 0:
             if global_step % (num_env * num_step * 100) == 0:
                 print('Now Global Step :{}'.format(global_step))
                 torch.save(agent.model.state_dict(), model_path)
@@ -310,11 +310,11 @@ def single_gpu_work(gpu, args):
 
 
 def main():
-    mp.set_start_method('fork')
+    mp.set_start_method('spawn')
     parser = argparse.ArgumentParser()
     parser.add_argument('-n', '--nodes', default=1,
                         type=int, metavar='N')
-    parser.add_argument('-g', '--gpus', default=1, type=int,
+    parser.add_argument('-g', '--gpus', default=4, type=int,
                         help='number of gpus per node')
     parser.add_argument('-nr', '--node_rank', default=0, type=int,
                         help='ranking within the nodes')
@@ -324,7 +324,7 @@ def main():
     os.environ['MASTER_ADDR'] = 'frost-6.las.iastate.edu'  #
     os.environ['MASTER_PORT'] = '8888'  #
     # you must fork, so that environments can be forked again. Do not spawn
-    mp.start_processes(single_gpu_work, nprocs=args.gpus, args=(args,), start_method="fork")  #
+    mp.start_processes(single_process_main, nprocs=args.gpus, args=(args,), start_method="spawn")  #
     # single_gpu_work(0,args)  #
     #########################################################
 

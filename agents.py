@@ -10,6 +10,7 @@ from torch.distributions.categorical import Categorical
 from model import CnnActorCriticNetwork, ICMModel
 import torch.distributed as dist
 
+
 class ICMAgent(object):
     def __init__(
             self,
@@ -45,9 +46,9 @@ class ICMAgent(object):
         self.eta = eta
         self.ppo_eps = ppo_eps
         self.clip_grad_norm = clip_grad_norm
-        self.device = torch.device('cuda:0' if use_cuda else 'cpu')
+        self.device = gpu
 
-        self.icm = ICMModel(input_size, output_size, use_cuda)
+        self.icm = ICMModel(input_size, output_size, gpu)
         self.optimizer = optim.Adam(list(self.model.parameters()) + list(self.icm.parameters()),
                                     lr=learning_rate)
 
@@ -103,7 +104,8 @@ class ICMAgent(object):
 
             real_next_state_feature, pred_next_state_feature, pred_action = self.icm(
                 [state, next_state, action_onehot])
-            intrinsic_reward = self.eta * F.mse_loss(real_next_state_feature, pred_next_state_feature, reduction='none').mean(-1)
+            intrinsic_reward = self.eta * F.mse_loss(real_next_state_feature, pred_next_state_feature,
+                                                     reduction='none').mean(-1)
         return intrinsic_reward.data.cpu().numpy()
 
     def train_model(self, s_batch, next_s_batch, target_batch, y_batch, adv_batch, old_policy):
@@ -177,4 +179,12 @@ class ICMAgent(object):
                 loss = (actor_loss + 0.5 * critic_loss - 0.001 * entropy) + forward_loss + inverse_loss
                 loss.backward()
                 # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                average_gradient(self.model, self.icm)
                 self.optimizer.step()
+
+
+def average_gradient(model, icm):
+    size = dist.get_world_size()
+    for param in list(model.parameters()) + list(icm.parameters()):
+        dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
+        param.grad.data /= size
